@@ -29,8 +29,8 @@ from diffusers.configuration_utils import FrozenDict
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.loaders import LoraLoaderMixin, TextualInversionLoaderMixin
 from diffusers.models import AutoencoderKL
-from ...modules.posemb_layers import get_nd_rotary_pos_embed
-# from diffusers.models.embeddings import get_3d_rotary_pos_embed
+# from ...modules.posemb_layers import get_nd_rotary_pos_embed
+from diffusers.models.embeddings import get_3d_rotary_pos_embed
 from diffusers.models.lora import adjust_lora_scale_text_encoder
 from diffusers.schedulers import KarrasDiffusionSchedulers
 from diffusers.utils import (
@@ -55,8 +55,6 @@ from ...utils.data_utils import black_image
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 EXAMPLE_DOC_STRING = """"""
-
-
 
 def get_dimension_slices_and_sizes(begin, end, size):
 
@@ -185,8 +183,6 @@ def get_resize_crop_region_for_grid(src, tgt_width, tgt_height):
     crop_left = int(round((tw - resize_width) / 2.0))
 
     return (crop_top, crop_left), (crop_top + resize_height, crop_left + resize_width)
-
-
 
 def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
     """
@@ -767,96 +763,38 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             latents = latents * self.scheduler.init_noise_sigma
         return latents
 
-
-
     def _prepare_rotary_positional_embeddings(
         self,
-        height: int,        # Pixel height of the current window
-        width: int,         # Pixel width of the current window
-        num_frames: int,    # Actual number of frames in the current latent window (e.g., latents.shape[2])
-        device: torch.device, # Note: get_nd_rotary_pos_embed creates tensors on CPU by default
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        height: int,
+        width: int,
+        num_frames: int,
+        device: torch.device,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+        p_t, p_h, p_w = self.transformer.config.patch_size
         
-        if not hasattr(self.transformer.config, "patch_size") or \
-           not isinstance(self.transformer.config.patch_size, list) or \
-           len(self.transformer.config.patch_size) != 3:
-            raise ValueError(f"transformer.config.patch_size must be a list of 3 integers, got {self.transformer.config.patch_size}")
+        num_patches_t = (num_frames + p_t - 1) // p_t
+        num_patches_h = height // p_h
+        num_patches_w = width // p_w
+        
+        head_dim = self.transformer.config.hidden_size // self.transformer.config.heads_num
 
-        patch_t, patch_h, patch_w = self.transformer.config.patch_size[0], self.transformer.config.patch_size[1], self.transformer.config.patch_size[2]
-        
-        grid_height = height // patch_h
-        grid_width = width // patch_w
-        num_temporal_patches = (num_frames + patch_t - 1) // patch_t
-        
-        if not hasattr(self.transformer.config, "rope_dim_list"):
-            raise ValueError("Transformer config missing 'rope_dim_list'")
+        grid_crops_coords = ((0, 0), (num_patches_h, num_patches_w))
 
-        # The 'start' argument for get_nd_rotary_pos_embed (when len(args)==0 for its internal get_meshgrid_nd call)
-        # specifies the dimensions of the grid (num_temporal_patches, grid_height, grid_width).
-        # The order should match the order in rope_dim_list [t, h, w].
-        grid_dimensions = (num_temporal_patches, grid_height, grid_width)
-
-        # Default theta, can be made configurable if needed
-        # (e.g., from self.transformer.config.rope_theta if available)
-        theta = 10000.0 
-        
-        freqs_cos, freqs_sin = get_nd_rotary_pos_embed(
-            rope_dim_list=self.transformer.config.rope_dim_list,
-            start=grid_dimensions,
-            theta=theta,
-            use_real=True,
+        freqs_cos, freqs_sin = get_3d_rotary_pos_embed(
+            crops_coords=grid_crops_coords,
+            temporal_size=num_patches_t,
+            grid_size=(num_patches_h, num_patches_w),
+            embed_dim=head_dim,
         )
-        print(f"DEBUG: freqs_cos: {freqs_cos}, shape: {None if freqs_cos is None else freqs_cos.shape}")
-        print(f"DEBUG: freqs_sin: {freqs_sin}, shape: {None if freqs_sin is None else freqs_sin.shape}")
-        if freqs_cos is None or freqs_sin is None:
-            raise ValueError("freqs_cos or freqs_sin is None. Check RoPE generation.")
+
+        # Reshape to match transformer's expected input shape [1, 14586, 24, 128]
+        freqs_cos = freqs_cos.reshape(1, -1, 1, head_dim)
+        freqs_sin = freqs_sin.reshape(1, -1, 1, head_dim)
+        
+        freqs_cos = freqs_cos.expand(1, -1, self.transformer.config.heads_num, head_dim)
+        freqs_sin = freqs_sin.expand(1, -1, self.transformer.config.heads_num, head_dim)
 
         return freqs_cos, freqs_sin
-
-
-
-    # def _prepare_rotary_positional_embeddings(
-    #     self,
-    #     height: int,        # Height of the LATENT window (e.g., window_h_lat)
-    #     width: int,         # Width of the LATENT window (e.g., window_w_lat)
-    #     num_frames: int,    # Temporal depth of the latents for this window (e.g., num_frames_latent)
-    #     device: torch.device,
-    # ) -> Tuple[torch.Tensor, torch.Tensor]:
-        
-    #     # grid_height/width are calculated from the current window's LATENT dimensions
-    #     # and the spatial patch size of the transformer.
-    #     grid_height = height // self.transformer.config.patch_size
-    #     grid_width = width // self.transformer.config.patch_size
-        
-    #     p_spatial = self.transformer.config.patch_size 
-    #     # Safely get patch_size_t, defaulting to spatial patch_size if not defined
-    #     p_t = getattr(self.transformer.config, 'patch_size_t', p_spatial) 
-
-    #     # These are base/max sizes for RoPE, usually from the transformer's original sample config
-    #     base_size_width = self.transformer.config.sample_width // p_spatial
-    #     base_size_height = self.transformer.config.sample_height // p_spatial
-        
-    #     # HunyuanVideo's RoPE is consistently of the "slice" type.
-    #     # We adapt this type for the current window's dimensions.
-        
-    #     # Calculate the number of temporal patches for the current window's frame depth
-    #     base_num_frames_window = (num_frames + p_t - 1) // p_t
-        
-    #     # IMPORTANT: Ensure get_3d_rotary_pos_embed is correctly imported/defined in your file
-    #     # from ..utils import get_3d_rotary_pos_embed (or similar based on your project structure)
-    #     freqs_cos, freqs_sin = get_3d_rotary_pos_embed(
-    #         embed_dim=self.transformer.config.attention_head_dim,
-    #         crops_coords=None,  # Hunyuan's "slice" type RoPE does not use crops_coords
-    #         grid_size=(grid_height, grid_width), # Grid dimensions for the current window
-    #         temporal_size=base_num_frames_window, # Patched temporal dimension for the window
-    #         grid_type="slice", # Consistent with Hunyuan's RoPE type
-    #         max_size=(base_size_height, base_size_width), # Reference max grid size
-    #         device=device,
-    #     )
-
-    #     return freqs_cos, freqs_sin
-
-
 
     # Copied from diffusers.pipelines.latent_consistency_models.pipeline_latent_consistency_text2img.LatentConsistencyModelPipeline.get_guidance_scale_embedding
     def get_guidance_scale_embedding(
@@ -1242,19 +1180,13 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             vae_dtype != torch.float32
         ) and not self.args.disable_autocast
         
-
-
-        # 8. Create ofs embeds if required
+        # 7.5. Create ofs embeds if required
         # ofs_emb = None if self.transformer.config.get("ofs_embed_dim", None) is None else latents.new_full((1,), fill_value=2.0)
         # Print the latent shape
 
-
-
-        # 9. Denoising loop
+        # 8. Denoising loop
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
-
-
 
         ###### Define the sliding-window related params ######
 
@@ -1265,8 +1197,6 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             window_size = (96, 128)
         else:
             window_size = (height // 8, width // 16)
-
-
 
         #####################  Define shift parameters ########################
         ll_height, ll_width = latents.shape[3], latents.shape[4]
@@ -1286,29 +1216,24 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         # print(f"Using dynamic shifts - width: {latent_step_size_w}, height: {latent_step_size_h}, loop_step: {loop_step}")
         # print(f'sampling {total_windows} views with tile size {window_size}, the whole latent shape is ({ll_height}, {ll_width})')
 
-
-
-        # Local ROPE
-        image_rotary_emb = [None for _ in range(total_windows)]
-        for j in range(total_windows):
-            image_rotary_emb[j] = (
-            self._prepare_rotary_positional_embeddings(window_size[0] * self.vae_scale_factor, window_size[1] * self.vae_scale_factor, latents.size(1), device)
-            # if self.transformer.config.get("use_rotary_positional_embeddings", False)
-            # else None
-            )
+        # # Local ROPE
+        # image_rotary_emb = [None for _ in range(total_windows)]
+        # for j in range(total_windows):
+        #     image_rotary_emb[j] = (
+        #     self._prepare_rotary_positional_embeddings(window_size[0] * self.vae_scale_factor, window_size[1] * self.vae_scale_factor, latents.size(1), device)
+        #     # if self.transformer.config.get("use_rotary_positional_embeddings", False)
+        #     # else None
+        #     )
+        
         # Create ring latent handler
         ring_latent_handler = RingLatent2D(latent_tensor=latents)
         ring_image_latent_handler = RingLatent2D(latent_tensor=img_latents)
-
-
 
         # if is_progress_bar:
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
-                
-
                 
                 j = 0
                 latent_pos_left_start = (i % loop_step) * latent_step_size_w 
@@ -1327,14 +1252,22 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                                                                                right=window_latent_right,
                                                                                top=window_latent_top,
                                                                                bottom=window_latent_down)
+
+                        # Generate RoPE for this window
+                        window_freqs_cos, window_freqs_sin = self._prepare_rotary_positional_embeddings(
+                            height=window_latent_down - window_latent_top,
+                            width=window_latent_right - window_latent_left,
+                            num_frames=latents_for_view.shape[2],
+                            device=device
+                        )
+
+                        freqs_cis = (window_freqs_cos, window_freqs_sin)
                         
                         image_latents_for_view = ring_image_latent_handler.get_window_latent(left=window_latent_left,
                                                                                              right=window_latent_right,
                                                                                              top=window_latent_top,
                                                                                              bottom=window_latent_down)
-                
-
-
+            
                         if i2v_mode and i2v_condition_type == "token_replace":
                             latent_model_input = torch.concat([image_latents_for_view, latents_for_view[:, :, 1:, :, :]], dim=2)
 
@@ -1377,8 +1310,8 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                                 text_states=prompt_embeds,  # [2, 256, 4096]
                                 text_mask=prompt_mask,  # [2, 256]
                                 text_states_2=prompt_embeds_2,  # [2, 768]
-                                freqs_cos=image_rotary_emb[j][0],  # from previous local RoPE
-                                freqs_sin=image_rotary_emb[j][1],  # from previous local RoPE
+                                freqs_cos=freqs_cis[0],  # from previous local RoPE
+                                freqs_sin=freqs_cis[1],  # from previous local RoPE
                                 guidance=guidance_expand,
                                 return_dict=True,
                             )[
