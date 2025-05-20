@@ -29,7 +29,6 @@ from diffusers.configuration_utils import FrozenDict
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.loaders import LoraLoaderMixin, TextualInversionLoaderMixin
 from diffusers.models import AutoencoderKL
-# from ...modules.posemb_layers import get_nd_rotary_pos_embed
 from diffusers.models.embeddings import get_3d_rotary_pos_embed
 from diffusers.models.lora import adjust_lora_scale_text_encoder
 from diffusers.schedulers import KarrasDiffusionSchedulers
@@ -51,8 +50,12 @@ from ...vae.autoencoder_kl_causal_3d import AutoencoderKLCausal3D
 from ...text_encoder import TextEncoder
 from ...modules import HYVideoDiffusionTransformer
 from ...utils.data_utils import black_image
+from ...modules.posemb_layers import get_nd_rotary_pos_embed
 
-logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+import logging
+logging.basicConfig(level=logging.DEBUG)
+
+logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
 EXAMPLE_DOC_STRING = """"""
 
@@ -708,7 +711,6 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                     f" {negative_prompt_embeds.shape}."
                 )
 
-
     def prepare_latents(
         self,
         batch_size,
@@ -763,37 +765,153 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             latents = latents * self.scheduler.init_noise_sigma
         return latents
 
-    def _prepare_rotary_positional_embeddings(
-        self,
-        height: int,
-        width: int,
-        num_frames: int,
-        device: torch.device,
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
-        p_t, p_h, p_w = self.transformer.config.patch_size
-        
-        num_patches_t = (num_frames + p_t - 1) // p_t
-        num_patches_h = height // p_h
-        num_patches_w = width // p_w
-        
+    def get_1d_rotary_pos_embed_riflex(
+        dim: int,
+        pos: Union[np.ndarray, int],
+        theta: float = 10000.0,
+        use_real=False,
+        k: Optional[int] = None,
+        L_test: Optional[int] = None,
+    ):
+        """
+        RIFLEx: Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
+
+        This function calculates a frequency tensor with complex exponentials using the given dimension 'dim' and the end
+        index 'end'. The 'theta' parameter scales the frequencies. The returned tensor contains complex values in complex64
+        data type.
+
+        Args:
+            dim (`int`): Dimension of the frequency tensor.
+            pos (`np.ndarray` or `int`): Position indices for the frequency tensor. [S] or scalar
+            theta (`float`, *optional*, defaults to 10000.0):
+                Scaling factor for frequency computation. Defaults to 10000.0.
+            use_real (`bool`, *optional*):
+                If True, return real part and imaginary part separately. Otherwise, return complex numbers.
+            k (`int`, *optional*, defaults to None): the index for the intrinsic frequency in RoPE
+            L_test (`int`, *optional*, defaults to None): the number of frames for inference
+        Returns:
+            `torch.Tensor`: Precomputed frequency tensor with complex exponentials. [S, D/2]
+        """
+        assert dim % 2 == 0
+
+        if isinstance(pos, int):
+            pos = torch.arange(pos)
+        if isinstance(pos, np.ndarray):
+            pos = torch.from_numpy(pos)  # type: ignore  # [S]
+
+        freqs = 1.0 / (
+                theta ** (torch.arange(0, dim, 2, device=pos.device)[: (dim // 2)].float() / dim)
+        )  # [D/2]
+
+        # === Riflex modification start ===
+        # Reduce the intrinsic frequency to stay within a single period after extrapolation (see Eq. (8)).
+        # Empirical observations show that a few videos may exhibit repetition in the tail frames.
+        # To be conservative, we multiply by 0.9 to keep the extrapolated length below 90% of a single period.
+        if k is not None:
+            freqs[k-1] = 0.9 * 2 * torch.pi / L_test
+        # === Riflex modification end ===
+
+        freqs = torch.outer(pos, freqs)  # type: ignore   # [S, D/2]
+        if use_real:
+            freqs_cos = freqs.cos().repeat_interleave(2, dim=1).float()  # [S, D]
+            freqs_sin = freqs.sin().repeat_interleave(2, dim=1).float()  # [S, D]
+            return freqs_cos, freqs_sin
+        else:
+            # lumina
+            freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64     # [S, D/2]
+            return freqs_cis
+
+    def get_rotary_pos_embed(self, video_length, height, width):
+        target_ndim = 3
+        ndim = 5 - 2  # B, C, F, H, W -> F, H, W
+    
+        # Compute latent sizes based on VAE type
+        if "884" in self.args.vae:
+            latents_size = [(video_length - 1) // 4 + 1, height // 8, width // 8]
+        elif "888" in self.args.vae:
+            latents_size = [(video_length - 1) // 8 + 1, height // 8, width // 8]
+        else:
+            latents_size = [video_length, height // 8, width // 8]
+    
+        # Compute rope sizes
+        if isinstance(self.transformer.config.patch_size, int):
+            assert all(s % self.transformer.config.patch_size == 0 for s in latents_size), (
+                f"Latent size(last {ndim} dimensions) should be divisible by patch size({self.transformer.config.patch_size}), "
+                f"but got {latents_size}."
+            )
+            rope_sizes = [s // self.transformer.config.patch_size for s in latents_size]
+        elif isinstance(self.transformer.config.patch_size, list):
+            assert all(
+                s % self.transformer.config.patch_size[idx] == 0
+                for idx, s in enumerate(latents_size)
+            ), (
+                f"Latent size(last {ndim} dimensions) should be divisible by patch size({self.transformer.config.patch_size}), "
+                f"but got {latents_size}."
+            )
+            rope_sizes = [s // self.transformer.config.patch_size[idx] for idx, s in enumerate(latents_size)]
+    
+        if len(rope_sizes) != target_ndim:
+            rope_sizes = [1] * (target_ndim - len(rope_sizes)) + rope_sizes  # Pad time axis
+    
+        # 20250316 pftq: Add RIFLEx logic for > 192 frames
+        L_test = rope_sizes[0]  # Latent frames
+        L_train = 25  # Training length from HunyuanVideo
+        actual_num_frames = video_length  # Use input video_length directly
+    
         head_dim = self.transformer.config.hidden_size // self.transformer.config.heads_num
-
-        grid_crops_coords = ((0, 0), (num_patches_h, num_patches_w))
-
-        freqs_cos, freqs_sin = get_3d_rotary_pos_embed(
-            crops_coords=grid_crops_coords,
-            temporal_size=num_patches_t,
-            grid_size=(num_patches_h, num_patches_w),
-            embed_dim=head_dim,
-        )
-
-        # Reshape to match transformer's expected input shape [1, 14586, 24, 128]
-        freqs_cos = freqs_cos.reshape(1, -1, 1, head_dim)
-        freqs_sin = freqs_sin.reshape(1, -1, 1, head_dim)
-        
-        freqs_cos = freqs_cos.expand(1, -1, self.transformer.config.heads_num, head_dim)
-        freqs_sin = freqs_sin.expand(1, -1, self.transformer.config.heads_num, head_dim)
-
+        rope_dim_list = self.transformer.config.rope_dim_list or [head_dim // target_ndim for _ in range(target_ndim)]
+        assert sum(rope_dim_list) == head_dim, "sum(rope_dim_list) must equal head_dim"
+    
+        if actual_num_frames > 192:
+            k = 2+((actual_num_frames + 3) // (4 * L_train))
+            k = max(4, min(8, k))
+            # logger.debug(f"actual_num_frames = {actual_num_frames} > 192, RIFLEx applied with k = {k}")
+    
+            # Compute positional grids for RIFLEx
+            axes_grids = [torch.arange(size, device=self.device, dtype=torch.float32) for size in rope_sizes]
+            grid = torch.meshgrid(*axes_grids, indexing="ij")
+            grid = torch.stack(grid, dim=0)  # [3, t, h, w]
+            pos = grid.reshape(3, -1).t()  # [t * h * w, 3]
+    
+            # Apply RIFLEx to temporal dimension
+            freqs = []
+            for i in range(3):
+                if i == 0:  # Temporal with RIFLEx
+                    freqs_cos, freqs_sin = self.get_1d_rotary_pos_embed_riflex(
+                        rope_dim_list[i],
+                        pos[:, i],
+                        theta=self.args.rope_theta,
+                        use_real=True,
+                        k=k,
+                        L_test=L_test
+                    )
+                else:  # Spatial with default RoPE
+                    freqs_cos, freqs_sin = self.get_1d_rotary_pos_embed_riflex(
+                        rope_dim_list[i],
+                        pos[:, i],
+                        theta=self.args.rope_theta,
+                        use_real=True,
+                        k=None,
+                        L_test=None
+                    )
+                freqs.append((freqs_cos, freqs_sin))
+                # logger.debug(f"freq[{i}] shape: {freqs_cos.shape}, device: {freqs_cos.device}")
+    
+            freqs_cos = torch.cat([f[0] for f in freqs], dim=1)
+            freqs_sin = torch.cat([f[1] for f in freqs], dim=1)
+            # logger.debug(f"freqs_cos shape: {freqs_cos.shape}, device: {freqs_cos.device}")
+        else:
+            # 20250316 pftq: Original code for <= 192 frames
+            # logger.debug(f"actual_num_frames = {actual_num_frames} <= 192, using original RoPE")
+            freqs_cos, freqs_sin = get_nd_rotary_pos_embed(
+                rope_dim_list,
+                rope_sizes,
+                theta=self.args.rope_theta,
+                use_real=True,
+                theta_rescale_factor=1,
+            )
+            # logger.debug(f"freqs_cos shape: {freqs_cos.shape}, device: {freqs_cos.device}")
+    
         return freqs_cos, freqs_sin
 
     # Copied from diffusers.pipelines.latent_consistency_models.pipeline_latent_consistency_text2img.LatentConsistencyModelPipeline.get_guidance_scale_embedding
@@ -1045,6 +1163,9 @@ class HunyuanVideoPipeline(DiffusionPipeline):
 
         device = torch.device(f"cuda:{dist.get_rank()}") if dist.is_initialized() else self._execution_device
 
+        # Store the original video_length for RoPE
+        original_video_frames = video_length
+
         # 3. Encode input prompt
         lora_scale = (
             self.cross_attention_kwargs.get("scale", None)
@@ -1179,10 +1300,6 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         vae_autocast_enabled = (
             vae_dtype != torch.float32
         ) and not self.args.disable_autocast
-        
-        # 7.5. Create ofs embeds if required
-        # ofs_emb = None if self.transformer.config.get("ofs_embed_dim", None) is None else latents.new_full((1,), fill_value=2.0)
-        # Print the latent shape
 
         # 8. Denoising loop
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
@@ -1215,15 +1332,6 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             latent_step_size_h = 0
         # print(f"Using dynamic shifts - width: {latent_step_size_w}, height: {latent_step_size_h}, loop_step: {loop_step}")
         # print(f'sampling {total_windows} views with tile size {window_size}, the whole latent shape is ({ll_height}, {ll_width})')
-
-        # # Local ROPE
-        # image_rotary_emb = [None for _ in range(total_windows)]
-        # for j in range(total_windows):
-        #     image_rotary_emb[j] = (
-        #     self._prepare_rotary_positional_embeddings(window_size[0] * self.vae_scale_factor, window_size[1] * self.vae_scale_factor, latents.size(1), device)
-        #     # if self.transformer.config.get("use_rotary_positional_embeddings", False)
-        #     # else None
-        #     )
         
         # Create ring latent handler
         ring_latent_handler = RingLatent2D(latent_tensor=latents)
@@ -1253,14 +1361,23 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                                                                                top=window_latent_top,
                                                                                bottom=window_latent_down)
 
-                        # Generate RoPE for this window
-                        window_freqs_cos, window_freqs_sin = self._prepare_rotary_positional_embeddings(
-                            height=window_latent_down - window_latent_top,
-                            width=window_latent_right - window_latent_left,
-                            num_frames=latents_for_view.shape[2],
-                            device=device
+                        # Calculate pixel dimensions for the current window/tile
+                        current_window_latent_height = window_latent_down - window_latent_top
+                        current_window_latent_width = window_latent_right - window_latent_left
+                        
+                        current_window_pixel_height = current_window_latent_height * self.vae_scale_factor
+                        current_window_pixel_width = current_window_latent_width * self.vae_scale_factor
+                        
+                        # logger.debug(f"Calling get_rotary_pos_embed with video_length={video_length}, height={current_window_pixel_height}, width={current_window_pixel_width}")
+                        
+                        # The 'video_length' parameter to __call__ is the original number of frames.
+                        # RoPE is calculated based on the original temporal length and the window's pixel dimensions.
+                        window_freqs_cos, window_freqs_sin = self.get_rotary_pos_embed(
+                            video_length=original_video_frames,
+                            height=current_window_pixel_height,
+                            width=current_window_pixel_width
                         )
-
+                        # logger.debug(f"Got window_freqs_cos.shape: {window_freqs_cos.shape}")
                         freqs_cis = (window_freqs_cos, window_freqs_sin)
                         
                         image_latents_for_view = ring_image_latent_handler.get_window_latent(left=window_latent_left,
@@ -1338,14 +1455,23 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                             latents_denoised_view = self.scheduler.step(
                                 noise_pred[:, :, 1:, :, :], t, latents_for_view[:, :, 1:, :, :], **extra_step_kwargs, return_dict=False
                             )[0]
-                            latents = torch.concat(
-                                [img_latents, latents], dim=2
+                            # Reconstruct the full window (F frames, e.g., 33) before setting
+                            # Get the first frame of the current window view from the ring latent handler
+                            current_window_view = ring_latent_handler.get_window_latent(
+                                top=window_latent_top, left=window_latent_left, right=window_latent_right, bottom=window_latent_down
                             )
+                            first_frame_of_window = current_window_view[:, :, 0:1, :, :]
+                            
+                            # Concatenate the first frame with the denoised subsequent frames
+                            reconstructed_full_window_denoised = torch.cat([first_frame_of_window, latents_denoised_view], dim=2)
+                            
+                            # Pass the reconstructed full window to set_window_latent
+                            to_set_in_ring = reconstructed_full_window_denoised
                         else:
                             latents_denoised_view = self.scheduler.step(
                                 noise_pred, t, latents_for_view, **extra_step_kwargs, return_dict=False
                             )[0]
-                        ring_latent_handler.set_window_latent(latents_denoised_view, top=window_latent_top, left=window_latent_left, right=window_latent_right, bottom=window_latent_down)
+                        ring_latent_handler.set_window_latent(to_set_in_ring, top=window_latent_top, left=window_latent_left, right=window_latent_right, bottom=window_latent_down)
                         j = j + 1
 
                 if callback_on_step_end is not None:
