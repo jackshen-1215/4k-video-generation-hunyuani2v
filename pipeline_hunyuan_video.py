@@ -740,14 +740,10 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             raise ValueError(f"Batch size must match length of generators list.")
 
         creation_device = device
-        if isinstance(generator, torch.Generator): 
-            generator_device = generator.device
-            if device.type == "meta" and generator_device.type != "meta":
-                creation_device = generator_device
-        elif isinstance(generator, list) and len(generator) > 0: 
-            generator_device = generator[0].device
-            if device.type == "meta" and generator_device.type != "meta":
-                creation_device = generator_device
+        if isinstance(generator, torch.Generator):
+            creation_device = generator.device
+        elif isinstance(generator, list) and len(generator) > 0:
+            creation_device = generator[0].device
         
         prepared_latents: torch.Tensor 
         if i2v_mode and i2v_stability:
