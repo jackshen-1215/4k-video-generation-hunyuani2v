@@ -50,7 +50,6 @@ from ...vae.autoencoder_kl_causal_3d import AutoencoderKLCausal3D
 from ...text_encoder import TextEncoder
 from ...modules import HYVideoDiffusionTransformer
 from ...utils.data_utils import black_image
-from ...modules.posemb_layers import get_nd_rotary_pos_embed
 
 import logging
 logging.basicConfig(level=logging.DEBUG)
@@ -714,205 +713,153 @@ class HunyuanVideoPipeline(DiffusionPipeline):
     def prepare_latents(
         self,
         batch_size,
-        num_channels_latents,
-        height,
-        width,
-        video_length,
+        num_channels_latents, 
+        height, 
+        width,  
+        video_length, # Full video latent frame count
         dtype,
-        device,
-        generator,
-        latents=None,
-        img_latents=None,
+        device, 
+        generator, 
+        latents: Optional[torch.Tensor] = None, # Optional external x_T
+        img_latents: Optional[torch.Tensor] = None, 
         i2v_mode=False,
         i2v_condition_type=None,
         i2v_stability=True,
     ):
+        shape_num_channels = self.vae.config.latent_channels
         if i2v_mode and i2v_condition_type == "latent_concat":
-            num_channels_latents = (num_channels_latents - 1) // 2
+            pass
+
+
         shape = (
-            batch_size,
-            num_channels_latents,
-            video_length,
-            int(height) // self.vae_scale_factor,
-            int(width) // self.vae_scale_factor,
+            batch_size, shape_num_channels, video_length,
+            int(height) // self.vae_scale_factor, int(width) // self.vae_scale_factor,
         )
+
         if isinstance(generator, list) and len(generator) != batch_size:
-            raise ValueError(
-                f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
-                f" size of {batch_size}. Make sure the batch size matches the length of the generators."
-            )
+            raise ValueError(f"Batch size must match length of generators list.")
 
+        creation_device = device
+        if isinstance(generator, torch.Generator): 
+            generator_device = generator.device
+            if device.type == "meta" and generator_device.type != "meta":
+                creation_device = generator_device
+        elif isinstance(generator, list) and len(generator) > 0: 
+            generator_device = generator[0].device
+            if device.type == "meta" and generator_device.type != "meta":
+                creation_device = generator_device
+        
+        prepared_latents: torch.Tensor 
         if i2v_mode and i2v_stability:
-            if img_latents.shape[2] == 1:
-                img_latents = img_latents.repeat(1, 1, video_length, 1, 1)
-            x0 = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-            x1 = img_latents
+            assert img_latents is not None and img_latents.shape[1] == shape_num_channels, \
+                "img_latents required for i2v_stability with matching VAE channels."
+            
+            img_latents_on_creation_device = img_latents.to(creation_device)
+            img_latents_expanded_time = img_latents_on_creation_device.repeat(1, 1, video_length, 1, 1) if img_latents_on_creation_device.shape[2] == 1 else img_latents_on_creation_device
+            
+            x0 = randn_tensor(shape, generator=generator, device=creation_device, dtype=dtype)
+            t_stability = torch.tensor([0.999], device=creation_device, dtype=dtype) 
+            prepared_latents = x0 * t_stability + img_latents_expanded_time * (1 - t_stability)
+            prepared_latents = prepared_latents.to(dtype=dtype) 
+        
+        elif latents is None: 
+            prepared_latents = randn_tensor(shape, generator=generator, device=creation_device, dtype=dtype)
+        else: 
+            prepared_latents = latents.to(creation_device, dtype=dtype) 
+            if prepared_latents.shape != shape:
+                raise ValueError(f"Provided latents shape {prepared_latents.shape} doesn't match {shape}.")
 
-            t = torch.tensor([0.999]).to(device=device)
-            latents = x0 * t + x1 * (1 - t)
-            latents = latents.to(dtype=dtype)
+        prepared_latents = prepared_latents.to(device)
 
-        if latents is None:
-            latents = randn_tensor(
-                shape, generator=generator, device=device, dtype=dtype
-            )
-        else:
-            latents = latents.to(device)
-
-        # Check existence to make it compatible with FlowMatchEulerDiscreteScheduler
         if hasattr(self.scheduler, "init_noise_sigma"):
-            # scale the initial noise by the standard deviation required by the scheduler
-            latents = latents * self.scheduler.init_noise_sigma
-        return latents
+            prepared_latents = prepared_latents * self.scheduler.init_noise_sigma
+        return prepared_latents
 
     def get_1d_rotary_pos_embed_riflex(
-        dim: int,
-        pos: Union[np.ndarray, int],
-        theta: float = 10000.0,
-        use_real=False,
-        k: Optional[int] = None,
-        L_test: Optional[int] = None,
+        self, dim: int, pos: Union[np.ndarray, int], theta: float = 10000.0,
+        use_real=False, k: Optional[int] = None, L_test: Optional[int] = None,
     ):
-        """
-        RIFLEx: Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
-
-        This function calculates a frequency tensor with complex exponentials using the given dimension 'dim' and the end
-        index 'end'. The 'theta' parameter scales the frequencies. The returned tensor contains complex values in complex64
-        data type.
-
-        Args:
-            dim (`int`): Dimension of the frequency tensor.
-            pos (`np.ndarray` or `int`): Position indices for the frequency tensor. [S] or scalar
-            theta (`float`, *optional*, defaults to 10000.0):
-                Scaling factor for frequency computation. Defaults to 10000.0.
-            use_real (`bool`, *optional*):
-                If True, return real part and imaginary part separately. Otherwise, return complex numbers.
-            k (`int`, *optional*, defaults to None): the index for the intrinsic frequency in RoPE
-            L_test (`int`, *optional*, defaults to None): the number of frames for inference
-        Returns:
-            `torch.Tensor`: Precomputed frequency tensor with complex exponentials. [S, D/2]
-        """
         assert dim % 2 == 0
+        # Ensure pos is a tensor on the correct device.
+        if isinstance(pos, int): pos = torch.arange(pos, device=self.device)
+        if isinstance(pos, np.ndarray): pos = torch.from_numpy(pos).to(self.device)
 
-        if isinstance(pos, int):
-            pos = torch.arange(pos)
-        if isinstance(pos, np.ndarray):
-            pos = torch.from_numpy(pos)  # type: ignore  # [S]
-
-        freqs = 1.0 / (
-                theta ** (torch.arange(0, dim, 2, device=pos.device)[: (dim // 2)].float() / dim)
-        )  # [D/2]
-
-        # === Riflex modification start ===
-        # Reduce the intrinsic frequency to stay within a single period after extrapolation (see Eq. (8)).
-        # Empirical observations show that a few videos may exhibit repetition in the tail frames.
-        # To be conservative, we multiply by 0.9 to keep the extrapolated length below 90% of a single period.
-        if k is not None:
+        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device=pos.device)[: (dim // 2)].float() / dim))
+        if k is not None and L_test is not None and L_test > 0: # RIFLEx modification.
             freqs[k-1] = 0.9 * 2 * torch.pi / L_test
-        # === Riflex modification end ===
+        
+        freqs = torch.outer(pos, freqs)
+        if use_real: # Return separate cos and sin components.
+            return freqs.cos().repeat_interleave(2, dim=1).float(), freqs.sin().repeat_interleave(2, dim=1).float()
+        else: # Return complex polar representation.
+            return torch.polar(torch.ones_like(freqs), freqs)
 
-        freqs = torch.outer(pos, freqs)  # type: ignore   # [S, D/2]
-        if use_real:
-            freqs_cos = freqs.cos().repeat_interleave(2, dim=1).float()  # [S, D]
-            freqs_sin = freqs.sin().repeat_interleave(2, dim=1).float()  # [S, D]
-            return freqs_cos, freqs_sin
-        else:
-            # lumina
-            freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64     # [S, D/2]
-            return freqs_cis
+    def get_rotary_pos_embed(self, video_length: int, window_pixel_h: int, window_pixel_w: int): # video_length is pixel frames
+        target_ndim = 3 # T, H, W for RoPE
 
-    def get_rotary_pos_embed(self, video_length, height, width):
-        target_ndim = 3
-        ndim = 5 - 2  # B, C, F, H, W -> F, H, W
-    
-        # Compute latent sizes based on VAE type
+        # Calculate latent dimensions for RoPE.
         if "884" in self.args.vae:
-            latents_size = [(video_length - 1) // 4 + 1, height // 8, width // 8]
+            latent_temporal_dim = (video_length - 1) // 4 + 1
         elif "888" in self.args.vae:
-            latents_size = [(video_length - 1) // 8 + 1, height // 8, width // 8]
+            latent_temporal_dim = (video_length - 1) // 8 + 1
         else:
-            latents_size = [video_length, height // 8, width // 8]
-    
-        # Compute rope sizes
+            latent_temporal_dim = video_length # Assuming 1-to-1 pixel to latent frame if not 884/888
+        
+        window_latent_h = window_pixel_h // self.vae_scale_factor
+        window_latent_w = window_pixel_w // self.vae_scale_factor
+        current_rope_latent_dims = [latent_temporal_dim, window_latent_h, window_latent_w]
+
+        # Determine patch sizes (temporal, height, width).
         if isinstance(self.transformer.config.patch_size, int):
-            assert all(s % self.transformer.config.patch_size == 0 for s in latents_size), (
-                f"Latent size(last {ndim} dimensions) should be divisible by patch size({self.transformer.config.patch_size}), "
-                f"but got {latents_size}."
-            )
-            rope_sizes = [s // self.transformer.config.patch_size for s in latents_size]
-        elif isinstance(self.transformer.config.patch_size, list):
-            assert all(
-                s % self.transformer.config.patch_size[idx] == 0
-                for idx, s in enumerate(latents_size)
-            ), (
-                f"Latent size(last {ndim} dimensions) should be divisible by patch size({self.transformer.config.patch_size}), "
-                f"but got {latents_size}."
-            )
-            rope_sizes = [s // self.transformer.config.patch_size[idx] for idx, s in enumerate(latents_size)]
-    
-        if len(rope_sizes) != target_ndim:
-            rope_sizes = [1] * (target_ndim - len(rope_sizes)) + rope_sizes  # Pad time axis
-    
-        # 20250316 pftq: Add RIFLEx logic for > 192 frames
-        L_test = rope_sizes[0]  # Latent frames
-        L_train = 25  # Training length from HunyuanVideo
-        actual_num_frames = video_length  # Use input video_length directly
+            p_t, p_h, p_w = [self.transformer.config.patch_size] * 3
+        elif isinstance(self.transformer.config.patch_size, list) and len(self.transformer.config.patch_size) == 3:
+            p_t, p_h, p_w = self.transformer.config.patch_size
+        else:
+            raise ValueError("Invalid transformer.config.patch_size format.")
+
+        # Calculate number of patches (rope_sizes).
+        assert all(current_rope_latent_dims[i] % [p_t, p_h, p_w][i] == 0 for i in range(3)), \
+            f"Latent dims {current_rope_latent_dims} not divisible by patch sizes {[p_t, p_h, p_w]}."
+        rope_sizes = [current_rope_latent_dims[i] // [p_t, p_h, p_w][i] for i in range(3)]
+            
+        L_test = rope_sizes[0] 
+        L_train = 25 
     
         head_dim = self.transformer.config.hidden_size // self.transformer.config.heads_num
-        rope_dim_list = self.transformer.config.rope_dim_list or [head_dim // target_ndim for _ in range(target_ndim)]
-        assert sum(rope_dim_list) == head_dim, "sum(rope_dim_list) must equal head_dim"
+        rope_dim_list = self.transformer.config.rope_dim_list or [head_dim // target_ndim] * target_ndim
+        assert sum(rope_dim_list) == head_dim, "Sum of rope_dim_list must equal head_dim."
     
-        if actual_num_frames > 192:
-            k = 2+((actual_num_frames + 3) // (4 * L_train))
-            k = max(4, min(8, k))
-            # logger.debug(f"actual_num_frames = {actual_num_frames} > 192, RIFLEx applied with k = {k}")
-    
-            # Compute positional grids for RIFLEx
-            axes_grids = [torch.arange(size, device=self.device, dtype=torch.float32) for size in rope_sizes]
-            grid = torch.meshgrid(*axes_grids, indexing="ij")
-            grid = torch.stack(grid, dim=0)  # [3, t, h, w]
-            pos = grid.reshape(3, -1).t()  # [t * h * w, 3]
-    
-            # Apply RIFLEx to temporal dimension
-            freqs = []
-            for i in range(3):
-                if i == 0:  # Temporal with RIFLEx
-                    freqs_cos, freqs_sin = self.get_1d_rotary_pos_embed_riflex(
-                        rope_dim_list[i],
-                        pos[:, i],
-                        theta=self.args.rope_theta,
-                        use_real=True,
-                        k=k,
-                        L_test=L_test
-                    )
-                else:  # Spatial with default RoPE
-                    freqs_cos, freqs_sin = self.get_1d_rotary_pos_embed_riflex(
-                        rope_dim_list[i],
-                        pos[:, i],
-                        theta=self.args.rope_theta,
-                        use_real=True,
-                        k=None,
-                        L_test=None
-                    )
-                freqs.append((freqs_cos, freqs_sin))
-                # logger.debug(f"freq[{i}] shape: {freqs_cos.shape}, device: {freqs_cos.device}")
-    
-            freqs_cos = torch.cat([f[0] for f in freqs], dim=1)
-            freqs_sin = torch.cat([f[1] for f in freqs], dim=1)
-            # logger.debug(f"freqs_cos shape: {freqs_cos.shape}, device: {freqs_cos.device}")
+        k_param_riflex = None 
+        if video_length > 192: 
+            k_param_riflex = 2 + ((video_length + 3) // (4 * L_train))
+            k_param_riflex = max(4, min(8, k_param_riflex))
+            logger.debug(f"RIFLEx active: k={k_param_riflex} for {video_length} frames.")
         else:
-            # 20250316 pftq: Original code for <= 192 frames
-            # logger.debug(f"actual_num_frames = {actual_num_frames} <= 192, using original RoPE")
-            freqs_cos, freqs_sin = get_nd_rotary_pos_embed(
-                rope_dim_list,
-                rope_sizes,
+            logger.debug(f"Standard RoPE for {video_length} frames.")
+
+        axes_grids = [torch.arange(s, device=self.device, dtype=torch.float32) for s in rope_sizes]
+        grid = torch.meshgrid(*axes_grids, indexing="ij")
+        pos = torch.stack(grid, dim=0).reshape(3, -1).t() 
+
+        freqs_list = [] 
+        for i_dim in range(3): 
+            current_k_for_riflex = k_param_riflex if i_dim == 0 and video_length > 192 else None
+            current_L_test_for_riflex = L_test if i_dim == 0 and video_length > 192 else None
+            
+            cos_d, sin_d = self.get_1d_rotary_pos_embed_riflex(
+                rope_dim_list[i_dim], 
+                pos[:, i_dim], 
                 theta=self.args.rope_theta,
                 use_real=True,
-                theta_rescale_factor=1,
+                k=current_k_for_riflex, 
+                L_test=current_L_test_for_riflex
             )
-            # logger.debug(f"freqs_cos shape: {freqs_cos.shape}, device: {freqs_cos.device}")
-    
-        return freqs_cos, freqs_sin
+            freqs_list.append((cos_d, sin_d))
+        
+        freqs_cos = torch.cat([f[0] for f in freqs_list], dim=1)
+        freqs_sin = torch.cat([f[1] for f in freqs_list], dim=1)
+        
+        return freqs_cos.to(self.device), freqs_sin.to(self.device)
 
     # Copied from diffusers.pipelines.latent_consistency_models.pipeline_latent_consistency_text2img.LatentConsistencyModelPipeline.get_guidance_scale_embedding
     def get_guidance_scale_embedding(
@@ -987,7 +934,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         prompt: Union[str, List[str]],
         height: int,
         width: int,
-        video_length: int,
+        video_length: int, 
         data_type: str = "video",
         num_inference_steps: int = 50,
         timesteps: List[int] = None,
@@ -997,7 +944,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         num_videos_per_prompt: Optional[int] = 1,
         eta: float = 0.0,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-        latents: Optional[torch.Tensor] = None,
+        latents: Optional[torch.Tensor] = None, 
         prompt_embeds: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         negative_prompt_embeds: Optional[torch.Tensor] = None,
@@ -1015,10 +962,10 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             ]
         ] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
-        freqs_cis: Tuple[torch.Tensor, torch.Tensor] = None,
+        freqs_cis: Tuple[torch.Tensor, torch.Tensor] = None, 
         vae_ver: str = "88-4c-sd",
         enable_tiling: bool = False,
-        n_tokens: Optional[int] = None,
+        n_tokens: Optional[int] = None, 
         embedded_guidance_scale: Optional[float] = None,
         i2v_mode: bool = False,
         i2v_condition_type: str = None,
@@ -1138,7 +1085,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             prompt,
             height,
             width,
-            video_length,
+            video_length, # Pixel video length
             callback_steps,
             negative_prompt,
             prompt_embeds,
@@ -1163,8 +1110,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
 
         device = torch.device(f"cuda:{dist.get_rank()}") if dist.is_initialized() else self._execution_device
 
-        # Store the original video_length for RoPE
-        original_video_frames = video_length
+        original_video_frames = video_length # Store original pixel video length
 
         # 3. Encode input prompt
         lora_scale = (
@@ -1220,9 +1166,6 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             prompt_mask_2 = None
             negative_prompt_mask_2 = None
 
-        # For classifier free guidance, we need to do two forward passes.
-        # Here we concatenate the unconditional and text embeddings into a single batch
-        # to avoid doing two forward passes
         if self.do_classifier_free_guidance:
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
             if prompt_mask is not None:
@@ -1232,61 +1175,63 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             if prompt_mask_2 is not None:
                 prompt_mask_2 = torch.cat([negative_prompt_mask_2, prompt_mask_2])
 
-
         # 4. Prepare timesteps
+        scheduler_n_tokens = n_tokens 
         extra_set_timesteps_kwargs = self.prepare_extra_func_kwargs(
-            self.scheduler.set_timesteps, {"n_tokens": n_tokens}
+            self.scheduler.set_timesteps, {"n_tokens": scheduler_n_tokens}
         )
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler,
             num_inference_steps,
-            device,
+            self.device,
             timesteps,
             sigmas,
             **extra_set_timesteps_kwargs,
         )
 
+        # Convert video_length from pixel frames to latent frames for prepare_latents
+        latent_video_length = original_video_frames 
         if "884" in vae_ver:
-            video_length = (video_length - 1) // 4 + 1
+            latent_video_length = (latent_video_length - 1) // 4 + 1
         elif "888" in vae_ver:
-            video_length = (video_length - 1) // 8 + 1
-        else:
-            video_length = video_length
+            latent_video_length = (latent_video_length - 1) // 8 + 1
+        # else: latent_video_length remains original_video_frames (pixel frames)
 
-        # 5. Prepare latent variables
-        num_channels_latents = self.transformer.config.in_channels
-
-        latents = self.prepare_latents(
+        # 5. Prepare initial latents (x_T)
+        # `latents` here is the initial optional latents passed to __call__
+        transformer_in_channels = self.transformer.config.in_channels
+        initial_latents_xt = self.prepare_latents(
             batch_size * num_videos_per_prompt,
-            num_channels_latents,
+            transformer_in_channels, 
             height,
             width,
-            video_length,
+            latent_video_length, # Pass latent_video_length
             prompt_embeds.dtype,
-            device,
-            generator,
-            latents,
-            img_latents=img_latents,
-            i2v_mode=i2v_mode,
-            i2v_condition_type=i2v_condition_type,
-            i2v_stability=i2v_stability
-        )
+            self.device, generator, 
+            latents, # Pass external latents if provided
+            img_latents, 
+            i2v_mode, 
+            i2v_condition_type, 
+            i2v_stability)
+        num_denoised_latent_channels = initial_latents_xt.shape[1] 
 
+        img_latents_cond_full, mask_concat_full = None, None
         if i2v_mode and i2v_condition_type == "latent_concat":
-            if img_latents.shape[2] == 1:
-                img_latents_concat = img_latents.repeat(1, 1, video_length, 1, 1)
-            else:
-                img_latents_concat = img_latents
-            img_latents_concat[:, :, 1:, ...] = 0
+            assert img_latents is not None and img_latents.shape[1] == num_denoised_latent_channels, \
+                "img_latents (VAE encoded) required for latent_concat with matching channels."
+            # Ensure img_latents_cond_full has latent_video_length frames for RingLatent2D
+            img_latents_cond_full = img_latents.repeat(1,1,latent_video_length,1,1) if img_latents.shape[2] == 1 else img_latents
+            if img_latents_cond_full.shape[2] != latent_video_length: # If original img_latents had >1 frame but not matching
+                 img_latents_cond_full = img_latents_cond_full[:,:,:latent_video_length,:,:] # Truncate or pad as needed - this is a basic truncate
+                 logger.warning(f"img_latents for concat was reshaped to {latent_video_length} frames")
 
-            i2v_mask = torch.zeros(video_length)
-            i2v_mask[0] = 1
 
-            mask_concat = torch.ones(img_latents_concat.shape[0], 1, img_latents_concat.shape[2], img_latents_concat.shape[3],
-                                     img_latents_concat.shape[4]).to(device=img_latents.device)
-            mask_concat[:, :, 1:, ...] = 0
+            mask_concat_full = torch.ones(initial_latents_xt.shape[0], 1, latent_video_length, 
+                                          initial_latents_xt.shape[3], initial_latents_xt.shape[4], 
+                                          device=self.device, dtype=prompt_embeds.dtype)
+            if latent_video_length > 1: mask_concat_full[:, :, 1:, ...] = 0
 
-        # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
+        # 6. Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_func_kwargs(
             self.scheduler.step,
             {"generator": generator, "eta": eta},
@@ -1306,187 +1251,158 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         self._num_timesteps = len(timesteps)
 
         ###### Define the sliding-window related params ######
+        ll_height, ll_width = initial_latents_xt.shape[3], initial_latents_xt.shape[4] 
+        window_h_latent = ll_height 
+        window_w_latent = max(ll_width // 2, self.transformer.config.patch_size[2] if isinstance(self.transformer.config.patch_size, list) else self.transformer.config.patch_size)
+        window_size_latent = (window_h_latent, window_w_latent)
 
-        # Choose the window_size according to the width of input image
-        if height == 768 and width == 2720: # 96，340
-            window_size = (96, 170)
-        elif height == 1536 and width == 3072: # 192, 384
-            window_size = (96, 128)
-        else:
-            window_size = (height // 8, width // 16)
-
-        #####################  Define shift parameters ########################
-        ll_height, ll_width = latents.shape[3], latents.shape[4]
-
-        num_windows_w = ll_width // window_size[1]
-        num_windows_h = ll_height // window_size[0]
-        total_windows = num_windows_w * num_windows_h
-        loop_step = 8
-
-        latent_step_size_w = window_size[1] // loop_step 
-        if num_windows_w == 1:
-            latent_step_size_w = 0
-
-        latent_step_size_h = window_size[0] // loop_step 
-        if num_windows_h == 1:
-            latent_step_size_h = 0
-        # print(f"Using dynamic shifts - width: {latent_step_size_w}, height: {latent_step_size_h}, loop_step: {loop_step}")
-        # print(f'sampling {total_windows} views with tile size {window_size}, the whole latent shape is ({ll_height}, {ll_width})')
+        num_windows_h = math.ceil(ll_height / window_size_latent[0])
+        num_windows_w = math.ceil(ll_width / window_size_latent[1])
+        loop_step = 8 
+        latent_step_size_w = window_size_latent[1] // loop_step if num_windows_w > 1 else 0 
+        latent_step_size_h = window_size_latent[0] // loop_step if num_windows_h > 1 else 0 
         
-        # Create ring latent handler
-        ring_latent_handler = RingLatent2D(latent_tensor=latents)
-        ring_image_latent_handler = RingLatent2D(latent_tensor=img_latents)
+        ring_latent_handler = RingLatent2D(initial_latents_xt) 
+        aggregated_noise_handler = RingLatent2D(torch.zeros_like(initial_latents_xt)) 
+        # Initialize ring_image_latent_handler only if needed and img_latents_cond_full is valid
+        ring_image_latent_handler = None
+        if i2v_mode and img_latents_cond_full is not None:
+             ring_image_latent_handler = RingLatent2D(img_latents_cond_full)
+        elif i2v_mode and img_latents is not None: # Fallback if cond_full wasn't prepared but img_latents exists
+             # This path might need img_latents to be correctly tiled to latent_video_length for RingLatent2D
+             tiled_img_latents = img_latents.repeat(1,1,latent_video_length,1,1) if img_latents.shape[2] == 1 else img_latents
+             if tiled_img_latents.shape[2] != latent_video_length:
+                  tiled_img_latents = tiled_img_latents[:,:,:latent_video_length,:,:] # Basic truncate
+             ring_image_latent_handler = RingLatent2D(tiled_img_latents)
 
-        # if is_progress_bar:
+
         with self.progress_bar(total=num_inference_steps) as progress_bar:
-            for i, t in enumerate(timesteps):
-                if self.interrupt:
-                    continue
+            for i, t in enumerate(timesteps): 
+                if self.interrupt: continue
+                current_full_latents_xt = ring_latent_handler.torch_latent.clone() 
+                aggregated_noise_handler.torch_latent.zero_() 
+                noise_contribution_counts = torch.zeros_like(aggregated_noise_handler.torch_latent, dtype=torch.int)
+
+                current_grid_offset_left = (i % loop_step) * latent_step_size_w
+                current_grid_offset_top = (i % loop_step) * latent_step_size_h
                 
-                j = 0
-                latent_pos_left_start = (i % loop_step) * latent_step_size_w 
-                latent_pos_top_start = (i % loop_step) * latent_step_size_h 
-                # print(f"In the i loop, i = {i}, latent_pos_left_start = {latent_pos_left_start}, latent_pos_top_start = {latent_pos_top_start}")
-                for shift_w_idx in range(num_windows_w):
-                    shift_h_idies_list = list(range(num_windows_h))
-
-                    for shift_h_idx in shift_h_idies_list:
-                        window_latent_left = latent_pos_left_start + shift_w_idx * window_size[1] # Why do this instead of latent_pos_left_start + window_size[1]? So that every time step we're getting windows across the whole latent?
-                        window_latent_right = window_latent_left + window_size[1]
-                        window_latent_top = latent_pos_top_start + shift_h_idx * window_size[0]
-                        window_latent_down = window_latent_top + window_size[0]
-                        # print(f"In the i loop, i = {i}, shift_w_idx = {shift_w_idx}, shift_h_idx = {shift_h_idx}, window_latent_left = {window_latent_left}, window_latent_right = {window_latent_right}, window_latent_top = {window_latent_top}, window_latent_down = {window_latent_down}")
-                        latents_for_view = ring_latent_handler.get_window_latent(left=window_latent_left,
-                                                                               right=window_latent_right,
-                                                                               top=window_latent_top,
-                                                                               bottom=window_latent_down)
-
-                        # Calculate pixel dimensions for the current window/tile
-                        current_window_latent_height = window_latent_down - window_latent_top
-                        current_window_latent_width = window_latent_right - window_latent_left
+                for shift_h_idx in range(num_windows_h): 
+                    for shift_w_idx in range(num_windows_w): 
+                        window_latent_top = current_grid_offset_top + shift_h_idx * window_size_latent[0] 
+                        window_latent_down = window_latent_top + window_size_latent[0] 
+                        window_latent_left = current_grid_offset_left + shift_w_idx * window_size_latent[1] 
+                        window_latent_right = window_latent_left + window_size_latent[1] 
                         
-                        current_window_pixel_height = current_window_latent_height * self.vae_scale_factor
-                        current_window_pixel_width = current_window_latent_width * self.vae_scale_factor
+                        latents_for_view = ring_latent_handler.get_window_latent(window_latent_top, window_latent_down, window_latent_left, window_latent_right) 
+                        if latents_for_view.shape[3] == 0 or latents_for_view.shape[4] == 0: continue
+
+                        current_window_pixel_height = latents_for_view.shape[3] * self.vae_scale_factor 
+                        current_window_pixel_width = latents_for_view.shape[4] * self.vae_scale_factor 
+                        window_freqs_cos, window_freqs_sin = self.get_rotary_pos_embed(original_video_frames, current_window_pixel_height, current_window_pixel_width) 
                         
-                        # logger.debug(f"Calling get_rotary_pos_embed with video_length={video_length}, height={current_window_pixel_height}, width={current_window_pixel_width}")
+                        latent_model_input = latents_for_view 
+                        if i2v_mode:
+                            image_latents_for_view = ring_image_latent_handler.get_window_latent(window_latent_top, window_latent_down, window_latent_left, window_latent_right) if ring_image_latent_handler else None
+                            if image_latents_for_view is not None: 
+                                if i2v_condition_type == "token_replace":
+                                    first_cond_f = image_latents_for_view[:,:,0:1,:,:] if image_latents_for_view.shape[2] > 0 else image_latents_for_view
+                                    if latents_for_view.shape[2] > 1:
+                                        latent_model_input = torch.cat([first_cond_f, latents_for_view[:,:,1:,:,:]], dim=2) 
+                                    elif latents_for_view.shape[2] == 1 and first_cond_f.shape[2] == 1 : 
+                                        latent_model_input = first_cond_f 
+                                    else: 
+                                        latent_model_input = first_cond_f 
+                                elif i2v_condition_type == "latent_concat":
+                                    # mask_concat_full should have been prepared with correct frame dimension
+                                    mask_view = RingLatent2D(mask_concat_full).get_window_latent(window_latent_top,window_latent_down,window_latent_left,window_latent_right)
+                                    latent_model_input = torch.cat([latent_model_input, image_latents_for_view, mask_view], dim=1)
                         
-                        # The 'video_length' parameter to __call__ is the original number of frames.
-                        # RoPE is calculated based on the original temporal length and the window's pixel dimensions.
-                        window_freqs_cos, window_freqs_sin = self.get_rotary_pos_embed(
-                            video_length=original_video_frames,
-                            height=current_window_pixel_height,
-                            width=current_window_pixel_width
-                        )
-                        # logger.debug(f"Got window_freqs_cos.shape: {window_freqs_cos.shape}")
-                        freqs_cis = (window_freqs_cos, window_freqs_sin)
+                        input_cfg = torch.cat([latent_model_input]*2) if self.do_classifier_free_guidance else latent_model_input
+                        input_scaled = self.scheduler.scale_model_input(input_cfg, t)
+                        t_exp = t.repeat(input_scaled.shape[0])
+                        guid_p = (torch.tensor([embedded_guidance_scale]*input_scaled.shape[0],dtype=target_dtype,device=self.device)*1000.0) if embedded_guidance_scale else None
+
+                        with torch.autocast(device_type="cuda", dtype=target_dtype, enabled=autocast_enabled):
+                            noise_raw = self.transformer(input_scaled, t_exp, prompt_embeds, prompt_mask, 
+                                                         prompt_embeds_2, window_freqs_cos, window_freqs_sin, guid_p, True)["x"] 
                         
-                        image_latents_for_view = ring_image_latent_handler.get_window_latent(left=window_latent_left,
-                                                                                             right=window_latent_right,
-                                                                                             top=window_latent_top,
-                                                                                             bottom=window_latent_down)
-            
-                        if i2v_mode and i2v_condition_type == "token_replace":
-                            latent_model_input = torch.concat([image_latents_for_view, latents_for_view[:, :, 1:, :, :]], dim=2)
-
-                        # expand the latents if we are doing classifier free guidance
-                        if i2v_mode and i2v_condition_type == "latent_concat":
-                            latent_model_input = torch.concat([latent_model_input, image_latents_for_view, mask_concat], dim=1)
-                        else:
-                            latent_model_input = latents_for_view
-
-                        latent_model_input = (
-                            torch.cat([latent_model_input] * 2)
-                            if self.do_classifier_free_guidance
-                            else latent_model_input
-                        )
-
-                        latent_model_input = self.scheduler.scale_model_input(
-                            latent_model_input, t
-                        )
-
-                        t_expand = t.repeat(latent_model_input.shape[0])
-                        guidance_expand = (
-                            torch.tensor(
-                                [embedded_guidance_scale] * latent_model_input.shape[0],
-                                dtype=torch.float32,
-                                device=device,
-                            ).to(target_dtype)
-                            * 1000.0
-                            if embedded_guidance_scale is not None
-                            else None
-                        )
-
-                        # predict the noise residual
-                        with torch.autocast(
-                            device_type="cuda", dtype=target_dtype, enabled=autocast_enabled
-                        ):
-                            noise_pred = self.transformer(  # For an input image (129, 192, 336) (1, 256, 256)
-                                latent_model_input,  # [2, 16, 33, 24, 42]
-                                t_expand,  # [2]
-                                # ofs=ofs_emb,
-                                text_states=prompt_embeds,  # [2, 256, 4096]
-                                text_mask=prompt_mask,  # [2, 256]
-                                text_states_2=prompt_embeds_2,  # [2, 768]
-                                freqs_cos=freqs_cis[0],  # from previous local RoPE
-                                freqs_sin=freqs_cis[1],  # from previous local RoPE
-                                guidance=guidance_expand,
-                                return_dict=True,
-                            )[
-                                "x"
-                            ]
-
-                        # perform guidance
+                        noise_pred_uncond, noise_pred_text = None, None 
                         if self.do_classifier_free_guidance:
-                            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                            noise_pred = noise_pred_uncond + self.guidance_scale * (
-                                noise_pred_text - noise_pred_uncond
-                            )
-
-                        if self.do_classifier_free_guidance and self.guidance_rescale > 0.0:
-                            # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
-                            noise_pred = rescale_noise_cfg(
-                                noise_pred,
-                                noise_pred_text,
-                                guidance_rescale=self.guidance_rescale,
-                            )
-
-                        # compute the previous noisy sample x_t -> x_t-1
+                            noise_pred_uncond, noise_pred_text = noise_raw.chunk(2)
+                            noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond) 
+                            if self.guidance_rescale > 0.0: noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, self.guidance_rescale)
+                        else: noise_pred = noise_raw
+                        
+                        final_noise_win = noise_pred[:, :num_denoised_latent_channels, ...]
+                        
+                        noise_to_agg = torch.zeros_like(latents_for_view)
                         if i2v_mode and i2v_condition_type == "token_replace":
-                            latents_denoised_view = self.scheduler.step(
-                                noise_pred[:, :, 1:, :, :], t, latents_for_view[:, :, 1:, :, :], **extra_step_kwargs, return_dict=False
-                            )[0]
-                            # Reconstruct the full window (F frames, e.g., 33) before setting
-                            # Get the first frame of the current window view from the ring latent handler
-                            current_window_view = ring_latent_handler.get_window_latent(
-                                top=window_latent_top, left=window_latent_left, right=window_latent_right, bottom=window_latent_down
-                            )
-                            first_frame_of_window = current_window_view[:, :, 0:1, :, :]
-                            
-                            # Concatenate the first frame with the denoised subsequent frames
-                            reconstructed_full_window_denoised = torch.cat([first_frame_of_window, latents_denoised_view], dim=2)
-                            
-                            # Pass the reconstructed full window to set_window_latent
-                            to_set_in_ring = reconstructed_full_window_denoised
-                        else:
-                            latents_denoised_view = self.scheduler.step(
-                                noise_pred, t, latents_for_view, **extra_step_kwargs, return_dict=False
-                            )[0]
-                        ring_latent_handler.set_window_latent(to_set_in_ring, top=window_latent_top, left=window_latent_left, right=window_latent_right, bottom=window_latent_down)
-                        j = j + 1
+                            if final_noise_win.shape[2] == latents_for_view.shape[2] -1 and latents_for_view.shape[2] > 0: 
+                                noise_to_agg[:,:,1:,:,:] = final_noise_win
+                            elif final_noise_win.shape[2] == latents_for_view.shape[2]: 
+                                noise_to_agg = final_noise_win
+                        else: noise_to_agg = final_noise_win
+
+                        h_slices, _ = get_dimension_slices_and_sizes(window_latent_top, window_latent_down, ll_height)
+                        w_slices, _ = get_dimension_slices_and_sizes(window_latent_left, window_latent_right, ll_width)
+                        h_off_v = 0
+                        for hs_a in h_slices:
+                            w_off_v = 0
+                            hs_v = slice(h_off_v, h_off_v + (hs_a.stop - hs_a.start))
+                            for ws_a in w_slices:
+                                ws_v = slice(w_off_v, w_off_v + (ws_a.stop - ws_a.start))
+                                aggregated_noise_handler.torch_latent[:,:,:,hs_a,ws_a] += noise_to_agg[:,:,:,hs_v,ws_v]
+                                noise_contribution_counts[:,:,:,hs_a,ws_a] += 1
+                                w_off_v += (ws_a.stop - ws_a.start)
+                            h_off_v += (hs_a.stop - hs_a.start)
+                valid_counts = noise_contribution_counts.float().clamp(min=1.0)
+                avg_model_out = aggregated_noise_handler.torch_latent / valid_counts
+                
+                model_out_sched = avg_model_out
+                sample_sched = current_full_latents_xt
+                if i2v_mode and i2v_condition_type == "token_replace": 
+                    if avg_model_out.shape[2] > 0 and current_full_latents_xt.shape[2] > 0 and \
+                       avg_model_out.shape[2] == current_full_latents_xt.shape[2] -1 : # Check if model output is one frame shorter
+                        model_out_sched = avg_model_out # Already F-1
+                        sample_sched = current_full_latents_xt[:,:,1:,:,:] # x_t also F-1
+                    elif avg_model_out.shape[2] == current_full_latents_xt.shape[2] and avg_model_out.shape[2] > 0: # If model output full length for some reason
+                        model_out_sched = avg_model_out[:,:,1:,:,:]
+                        sample_sched = current_full_latents_xt[:,:,1:,:,:]
+
+
+                denoised_part = self.scheduler.step(model_out_sched, t, sample_sched, **extra_step_kwargs)[0]
+
+                denoised_next_t = None
+                if i2v_mode and i2v_condition_type == "token_replace":
+                    if current_full_latents_xt.shape[2] > 0: 
+                        first_frame_to_keep = current_full_latents_xt[:,:,0:1,:,:] 
+                        if first_frame_to_keep.shape[2] + denoised_part.shape[2] == current_full_latents_xt.shape[2]:
+                            denoised_next_t = torch.cat([first_frame_to_keep, denoised_part], dim=2)
+                        else: 
+                            denoised_next_t = denoised_part 
+                            logger.warning(f"Frame concat issue in token_replace. Result frames: {denoised_part.shape[2]}, expected {current_full_latents_xt.shape[2]-1 if current_full_latents_xt.shape[2]>0 else 0}")
+                    else: 
+                        denoised_next_t = denoised_part
+                else: 
+                    denoised_next_t = denoised_part
+                
+                ring_latent_handler.torch_latent = denoised_next_t 
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
-                    for k in callback_on_step_end_tensor_inputs:
-                        callback_kwargs[k] = locals()[k]
+                    for k_cb in callback_on_step_end_tensor_inputs: 
+                        callback_kwargs[k_cb] = locals()[k_cb]
                     callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
 
-                    latents = callback_outputs.pop("latents", latents)
+                    _latents_from_cb = callback_outputs.pop("latents", None)
+                    if _latents_from_cb is not None:
+                        latents = _latents_from_cb 
+                        
                     prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
                     negative_prompt_embeds = callback_outputs.pop(
                         "negative_prompt_embeds", negative_prompt_embeds
                     )
 
-                # call the callback, if provided
                 if i == len(timesteps) - 1 or (
                     (i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0
                 ):
@@ -1494,33 +1410,33 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                         progress_bar.update()
                     if callback is not None and i % callback_steps == 0:
                         step_idx = i // getattr(self.scheduler, "order", 1)
-                        callback(step_idx, t, latents)
+                        callback(step_idx, t, ring_latent_handler.torch_latent) 
 
-        latents = ring_latent_handler.torch_latent.clone().to(device=latents.device)
+        final_latents = ring_latent_handler.torch_latent.clone() 
 
         if not output_type == "latent":
             expand_temporal_dim = False
-            if len(latents.shape) == 4:
+            if len(final_latents.shape) == 4: 
                 if isinstance(self.vae, AutoencoderKLCausal3D):
-                    latents = latents.unsqueeze(2)
+                    final_latents = final_latents.unsqueeze(2) 
                     expand_temporal_dim = True
-            elif len(latents.shape) == 5:
+            elif len(final_latents.shape) == 5: 
                 pass
             else:
                 raise ValueError(
-                    f"Only support latents with shape (b, c, h, w) or (b, c, f, h, w), but got {latents.shape}."
+                    f"Only support latents with shape (b, c, h, w) or (b, c, f, h, w), but got {final_latents.shape}." 
                 )
 
             if (
                 hasattr(self.vae.config, "shift_factor")
                 and self.vae.config.shift_factor
             ):
-                latents = (
-                    latents / self.vae.config.scaling_factor
+                image_latents = ( 
+                    final_latents / self.vae.config.scaling_factor 
                     + self.vae.config.shift_factor
                 )
             else:
-                latents = latents / self.vae.config.scaling_factor
+                image_latents = final_latents / self.vae.config.scaling_factor 
 
             with torch.autocast(
                 device_type="cuda", dtype=vae_dtype, enabled=vae_autocast_enabled
@@ -1528,27 +1444,27 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                 if enable_tiling:
                     self.vae.enable_tiling()
                     image = self.vae.decode(
-                        latents, return_dict=False, generator=generator
+                        image_latents, return_dict=False, generator=generator 
                     )[0]
                 else:
                     image = self.vae.decode(
-                        latents, return_dict=False, generator=generator
+                        image_latents, return_dict=False, generator=generator 
                     )[0]
 
             if expand_temporal_dim or image.shape[2] == 1:
                 image = image.squeeze(2)
-
         else:
-            image = latents
+            image = final_latents
 
         image = (image / 2 + 0.5).clamp(0, 1)
-        # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
         image = image.cpu().float()
 
         if i2v_mode and i2v_condition_type == "latent_concat":
-            image = image[:, :, 4:, :, :]
+            if image.shape[2] > 4: 
+                image = image[:, :, 4:, :, :]
+            else:
+                logger.warning(f"i2v_mode with latent_concat: frame slicing expects >4 frames, got {image.shape[2]}. Skipping slice.")
 
-        # Offload all models
         self.maybe_free_model_hooks()
 
         if not return_dict:
