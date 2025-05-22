@@ -1106,6 +1106,15 @@ class HunyuanVideoPipeline(DiffusionPipeline):
 
         device = torch.device(f"cuda:{dist.get_rank()}") if dist.is_initialized() else self._execution_device
 
+        # Ensure transformer is on the correct device
+        self.transformer.to(device)
+
+        # Ensure img_latents (if provided for i2v_mode) is on the correct device and not meta
+        if i2v_mode and img_latents is not None:
+            if img_latents.device.type == 'meta' or img_latents.device != device:
+                logger.debug(f"Moving img_latents from {img_latents.device} to {device}")
+                img_latents = img_latents.to(device)
+
         original_video_frames = video_length # Store original pixel video length
 
         # 3. Encode input prompt
@@ -1203,12 +1212,17 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             width,
             latent_video_length, # Pass latent_video_length
             prompt_embeds.dtype,
-            self.device, generator, 
+            self.device, # This is self._execution_device
+            generator, 
             latents, # Pass external latents if provided
-            img_latents, 
+            img_latents, # img_latents is already on the target CUDA `device` due to earlier .to(device)
             i2v_mode, 
             i2v_condition_type, 
             i2v_stability)
+        
+        # Explicitly move initial_latents_xt to the target computation `device` (CUDA)
+        initial_latents_xt = initial_latents_xt.to(device)
+        
         num_denoised_latent_channels = initial_latents_xt.shape[1] 
 
         img_latents_cond_full, mask_concat_full = None, None
@@ -1218,13 +1232,13 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             # Ensure img_latents_cond_full has latent_video_length frames for RingLatent2D
             img_latents_cond_full = img_latents.repeat(1,1,latent_video_length,1,1) if img_latents.shape[2] == 1 else img_latents
             if img_latents_cond_full.shape[2] != latent_video_length: # If original img_latents had >1 frame but not matching
-                 img_latents_cond_full = img_latents_cond_full[:,:,:latent_video_length,:,:] # Truncate or pad as needed - this is a basic truncate
+                 img_latents_cond_full = img_latents_cond_full[:,:,:latent_video_length,:,:] 
                  logger.warning(f"img_latents for concat was reshaped to {latent_video_length} frames")
 
-
+            # Ensure mask_concat_full is created on the target CUDA `device`
             mask_concat_full = torch.ones(initial_latents_xt.shape[0], 1, latent_video_length, 
                                           initial_latents_xt.shape[3], initial_latents_xt.shape[4], 
-                                          device=self.device, dtype=prompt_embeds.dtype)
+                                          device=device, dtype=prompt_embeds.dtype)
             if latent_video_length > 1: mask_concat_full[:, :, 1:, ...] = 0
 
         # 6. Prepare extra step kwargs.
@@ -1258,12 +1272,14 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         latent_step_size_w = window_size_latent[1] // loop_step if num_windows_w > 1 else 0 
         latent_step_size_h = window_size_latent[0] // loop_step if num_windows_h > 1 else 0 
         
+        # initial_latents_xt is now on the target CUDA `device`
         ring_latent_handler = RingLatent2D(initial_latents_xt) 
-        aggregated_noise_handler = RingLatent2D(torch.zeros_like(initial_latents_xt)) 
-        # Initialize ring_image_latent_handler only if needed and img_latents_cond_full is valid
+        # Ensure aggregated_noise_handler's internal tensor is on the target CUDA `device`
+        aggregated_noise_handler = RingLatent2D(torch.zeros_like(initial_latents_xt, device=device)) 
+        
         ring_image_latent_handler = None
-        if i2v_mode and img_latents_cond_full is not None:
-             ring_image_latent_handler = RingLatent2D(img_latents_cond_full)
+        if i2v_mode and img_latents_cond_full is not None: # img_latents_cond_full is on CUDA `device`
+            ring_image_latent_handler = RingLatent2D(img_latents_cond_full)
         elif i2v_mode and img_latents is not None: # Fallback if cond_full wasn't prepared but img_latents exists
              # This path might need img_latents to be correctly tiled to latent_video_length for RingLatent2D
              tiled_img_latents = img_latents.repeat(1,1,latent_video_length,1,1) if img_latents.shape[2] == 1 else img_latents
@@ -1277,7 +1293,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                 if self.interrupt: continue
                 current_full_latents_xt = ring_latent_handler.torch_latent.clone() 
                 aggregated_noise_handler.torch_latent.zero_() 
-                noise_contribution_counts = torch.zeros_like(aggregated_noise_handler.torch_latent, dtype=torch.int)
+                noise_contribution_counts = torch.zeros_like(aggregated_noise_handler.torch_latent, dtype=torch.int, device=device) # Ensure on CUDA
 
                 current_grid_offset_left = (i % loop_step) * latent_step_size_w
                 current_grid_offset_top = (i % loop_step) * latent_step_size_h
@@ -1295,28 +1311,40 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                         current_window_pixel_height = latents_for_view.shape[3] * self.vae_scale_factor 
                         current_window_pixel_width = latents_for_view.shape[4] * self.vae_scale_factor 
                         window_freqs_cos, window_freqs_sin = self.get_rotary_pos_embed(original_video_frames, current_window_pixel_height, current_window_pixel_width) 
+                        # Ensure rotary embeddings are on the correct device
+                        window_freqs_cos = window_freqs_cos.to(device)
+                        window_freqs_sin = window_freqs_sin.to(device)
                         
-                        latent_model_input = latents_for_view 
+                        latent_model_input = latents_for_view.to(device) # Ensure latents_for_view is on the target device
                         if i2v_mode:
                             image_latents_for_view = ring_image_latent_handler.get_window_latent(window_latent_top, window_latent_down, window_latent_left, window_latent_right) if ring_image_latent_handler else None
                             if image_latents_for_view is not None: 
+                                image_latents_for_view = image_latents_for_view.to(device) # Ensure device consistency
                                 if i2v_condition_type == "token_replace":
+                                    # first_cond_f will be on `device` because image_latents_for_view is
                                     first_cond_f = image_latents_for_view[:,:,0:1,:,:] if image_latents_for_view.shape[2] > 0 else image_latents_for_view
+                                    
+                                    # latents_for_view_slice will be on `device` because latent_model_input (from latents_for_view) is
+                                    latents_for_view_slice = latent_model_input[:,:,1:,:,:]
+                                    
                                     if latents_for_view.shape[2] > 1:
-                                        latent_model_input = torch.cat([first_cond_f, latents_for_view[:,:,1:,:,:]], dim=2) 
+                                        latent_model_input = torch.cat([first_cond_f, latents_for_view_slice], dim=2) 
                                     elif latents_for_view.shape[2] == 1 and first_cond_f.shape[2] == 1 : 
                                         latent_model_input = first_cond_f 
                                     else: 
                                         latent_model_input = first_cond_f 
                                 elif i2v_condition_type == "latent_concat":
-                                    # mask_concat_full should have been prepared with correct frame dimension
+                                    # Ensure mask_concat_full is on the correct device before RingLatent2D
+                                    # and image_latents_for_view is already on device
                                     mask_view = RingLatent2D(mask_concat_full).get_window_latent(window_latent_top,window_latent_down,window_latent_left,window_latent_right)
-                                    latent_model_input = torch.cat([latent_model_input, image_latents_for_view, mask_view], dim=1)
+                                    latent_model_input = torch.cat([latent_model_input, image_latents_for_view, mask_view.to(device)], dim=1)
                         
-                        input_cfg = torch.cat([latent_model_input]*2) if self.do_classifier_free_guidance else latent_model_input
-                        input_scaled = self.scheduler.scale_model_input(input_cfg, t)
-                        t_exp = t.repeat(input_scaled.shape[0])
-                        guid_p = (torch.tensor([embedded_guidance_scale]*input_scaled.shape[0],dtype=target_dtype,device=self.device)*1000.0) if embedded_guidance_scale else None
+                        input_cfg = torch.cat([latent_model_input.to(device)]*2) if self.do_classifier_free_guidance else latent_model_input.to(device)
+                        
+                        t_on_device = t.to(device) if isinstance(t, torch.Tensor) else torch.tensor(t, device=device, dtype=torch.long) # Ensure t is long for scheduler
+                        input_scaled = self.scheduler.scale_model_input(input_cfg, t_on_device)
+                        t_exp = t_on_device.repeat(input_scaled.shape[0])
+                        guid_p = (torch.tensor([embedded_guidance_scale]*input_scaled.shape[0],dtype=target_dtype,device=device)*1000.0) if embedded_guidance_scale else None
 
                         with torch.autocast(device_type="cuda", dtype=target_dtype, enabled=autocast_enabled):
                             noise_raw = self.transformer(input_scaled, t_exp, prompt_embeds, prompt_mask, 
