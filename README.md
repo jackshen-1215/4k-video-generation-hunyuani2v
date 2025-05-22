@@ -48,4 +48,3 @@ python3 sample_image2video.py \
     --use-cpu-offload \
     --save-path ./results
 ```
-```
